@@ -44,10 +44,10 @@ def lorenz_rhs(t, u, sigma, rho, beta):
                            x * y - beta * z])
 
 
-def integrate(theta, u0, t_eval, rtol=1e-9, atol=1e-9):
-    """Integrate from u0 (shape (3,) or (3, K)) over t_eval. Returns (3, K, nt)."""
+def integrate(theta, u0, t_eval, rtol=1e-9, atol=1e-9, rhs=lorenz_rhs):
+    """Integrate rhs(t, u, *theta) from u0 (shape (3,) or (3, K)) over t_eval. Returns (3, K, nt)."""
     u0 = np.asarray(u0, dtype=float).reshape(3, -1)
-    sol = solve_ivp(lorenz_rhs, (t_eval[0], t_eval[-1]), u0.ravel(),
+    sol = solve_ivp(rhs, (t_eval[0], t_eval[-1]), u0.ravel(),
                     t_eval=t_eval, args=tuple(theta), method="DOP853",
                     rtol=rtol, atol=atol)
     if not sol.success or sol.y.shape[1] != len(t_eval):
@@ -107,9 +107,12 @@ class MultipleShooting:
     All K segments are integrated *simultaneously* as one 3K-dim system on
     the common local time grid, so each residual evaluation is a single
     solve_ivp call.
+
+    rhs(t, u, *theta) can be any model with nparam parameters (default: Lorenz).
     """
 
-    def __init__(self, t, u, seg_len, continuity_weight=1.0):
+    def __init__(self, t, u, seg_len, continuity_weight=1.0, rhs=lorenz_rhs, nparam=3):
+        self.rhs, self.nparam = rhs, nparam
         dt = t[1] - t[0]
         self.n = int(round(seg_len / dt)) + 1              # points per segment
         self.K = (len(t) - 1) // (self.n - 1)              # number of segments
@@ -121,11 +124,11 @@ class MultipleShooting:
         self.w = continuity_weight
 
     def unpack(self, p):
-        return p[:3], p[3:].reshape(3, self.K)
+        return p[:self.nparam], p[self.nparam:].reshape(3, self.K)
 
     def residuals(self, p):
         theta, u0 = self.unpack(p)
-        sim = integrate(theta, u0, self.tloc, rtol=1e-8, atol=1e-8)
+        sim = integrate(theta, u0, self.tloc, rtol=1e-8, atol=1e-8, rhs=self.rhs)
         r_data = (sim - self.data).ravel()
         # end of segment k should equal start of segment k+1
         r_cont = self.w * (sim[:, :-1, -1] - u0[:, 1:]).ravel()
@@ -133,20 +136,20 @@ class MultipleShooting:
 
     def jac_sparsity(self):
         """Segment k's residuals depend only on theta and on u0 of segment k (and k+1)."""
-        K, n = self.K, self.n
+        K, n, m = self.K, self.n, self.nparam
         n_data, n_cont = 3 * K * n, 3 * (K - 1)
-        S = lil_matrix((n_data + n_cont, 3 + 3 * K), dtype=int)
-        S[:, :3] = 1
+        S = lil_matrix((n_data + n_cont, m + 3 * K), dtype=int)
+        S[:, :m] = 1
         for c in range(3):                  # residual component
             for k in range(K):
                 rows = c * K * n + k * n + np.arange(n)
                 for j in range(3):          # u0 component
-                    S[rows, 3 + j * K + k] = 1
+                    S[rows, m + j * K + k] = 1
             for k in range(K - 1):
                 row = n_data + c * (K - 1) + k
                 for j in range(3):
-                    S[row, 3 + j * K + k] = 1
-                S[row, 3 + c * K + k + 1] = 1
+                    S[row, m + j * K + k] = 1
+                S[row, m + c * K + k + 1] = 1
         return S
 
     def fit(self, theta0, verbose=0):
